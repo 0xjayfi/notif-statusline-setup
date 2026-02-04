@@ -16,6 +16,11 @@ Display a rich statusline showing:
 - Git branch (when in a repo)
 - Project folder name
 
+**Example Output:**
+```
+🤖 Claude Sonnet 4 │ ⏳ [====------] 42% 84k/200k tokens │ 🌿 main │ 📁 my-project
+```
+
 ## Quick Install
 
 ```bash
