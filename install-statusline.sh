@@ -59,6 +59,7 @@ from pathlib import Path
 LOCAL_TZ = timezone(timedelta(hours=8))
 COST_LOG = Path.home() / ".claude" / "session-costs.csv"
 LOCK_PATH = COST_LOG.with_suffix(".lock")
+SHEETS_LOCK_PATH = Path.home() / ".claude" / ".sheets-sync.lock"
 THROTTLE_FILE = Path.home() / ".claude" / ".sheets-sync-ts"
 SHEETS_THROTTLE_SECS = 60
 
@@ -85,6 +86,23 @@ class CsvLock:
 
     def __enter__(self):
         self._f = open(LOCK_PATH, "w")
+        fcntl.flock(self._f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *args):
+        fcntl.flock(self._f, fcntl.LOCK_UN)
+        self._f.close()
+
+
+class SheetsLock:
+    """Exclusive lock for Google Sheets sync to prevent concurrent appends.
+
+    Without this, two concurrent processes can both ws.find() → None and
+    both ws.append_row(), creating duplicate rows.
+    """
+
+    def __enter__(self):
+        self._f = open(SHEETS_LOCK_PATH, "w")
         fcntl.flock(self._f, fcntl.LOCK_EX)
         return self
 
@@ -279,43 +297,48 @@ def touch_throttle():
 
 
 def sync_to_sheets(row: dict) -> bool:
-    """Upsert a row in Google Sheets by session_id."""
+    """Upsert a row in Google Sheets by session_id.
+
+    Protected by SheetsLock to prevent concurrent find+append races
+    where two processes both see no existing row and both append.
+    """
     try:
         import gspread
 
-        gc = gspread.service_account(filename=SA_KEY_PATH)
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.sheet1
+        with SheetsLock():
+            gc = gspread.service_account(filename=SA_KEY_PATH)
+            sh = gc.open_by_key(SHEET_ID)
+            ws = sh.sheet1
 
-        # Ensure headers exist
-        try:
-            existing_headers = ws.row_values(1)
-        except Exception:
-            existing_headers = []
+            # Ensure headers exist
+            try:
+                existing_headers = ws.row_values(1)
+            except Exception:
+                existing_headers = []
 
-        if not existing_headers:
-            ws.append_row(HEADERS)
-            existing_headers = HEADERS
+            if not existing_headers:
+                ws.append_row(HEADERS)
+                existing_headers = HEADERS
 
-        # Build the row values in header order
-        row_values = [str(row.get(h, "")) for h in HEADERS]
+            # Build the row values in header order
+            row_values = [str(row.get(h, "")) for h in HEADERS]
 
-        # Find existing row by session_id (column B = index 2)
-        session_id = row["session_id"]
-        try:
-            cell = ws.find(session_id, in_column=2)
-        except gspread.exceptions.CellNotFound:
-            cell = None
+            # Find existing row by session_id (column B = index 2)
+            session_id = row["session_id"]
+            try:
+                cell = ws.find(session_id, in_column=2)
+            except gspread.exceptions.CellNotFound:
+                cell = None
 
-        if cell:
-            # Update existing row
-            row_number = cell.row
-            ws.update(f"A{row_number}:{chr(64 + len(HEADERS))}{row_number}", [row_values])
-        else:
-            # Append new row
-            ws.append_row(row_values)
+            if cell:
+                # Update existing row
+                row_number = cell.row
+                ws.update(f"A{row_number}:{chr(64 + len(HEADERS))}{row_number}", [row_values])
+            else:
+                # Append new row
+                ws.append_row(row_values)
 
-        touch_throttle()
+            touch_throttle()
         return True
     except Exception as e:
         print(f"Sheets sync failed: {e}", file=sys.stderr)
