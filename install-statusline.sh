@@ -128,7 +128,7 @@ def build_row(input_data: dict, live_mode: bool, pid: str = "") -> dict:
     }
 
 
-def upsert_row(row: dict, reap_stale: bool = False) -> None:
+def upsert_row(row: dict, reap_stale: bool = False) -> list[str]:
     """Update existing row for session_id in-place, or append if not found.
 
     When reap_stale is True (live mode), check all other "alive" sessions
@@ -136,11 +136,14 @@ def upsert_row(row: dict, reap_stale: bool = False) -> None:
     - Their PID is no longer running (or missing), OR
     - They share the same PID as the current session but have a different
       session_id (happens on /clear where the process stays but session changes).
+
+    Returns a list of session IDs that were reaped (status changed to concluded).
     """
     with CsvLock():
         session_id = row["session_id"]
         current_pid = row.get("pid", "").strip()
         rows: list[dict] = []
+        reaped: list[str] = []
         found = False
 
         if COST_LOG.exists():
@@ -148,6 +151,14 @@ def upsert_row(row: dict, reap_stale: bool = False) -> None:
                 reader = csv.DictReader(f)
                 for existing in reader:
                     if existing["session_id"] == session_id:
+                        # Overwrite protection: don't let a late "alive" tick
+                        # overwrite a row already marked "concluded"
+                        if (existing.get("status") == "concluded"
+                                and row.get("status") == "alive"
+                                and current_pid
+                                and existing.get("pid", "").strip() == current_pid):
+                            row = dict(row)
+                            row["status"] = "concluded"
                         rows.append(row)
                         found = True
                     else:
@@ -157,12 +168,15 @@ def upsert_row(row: dict, reap_stale: bool = False) -> None:
                             # The old session is superseded by the new one.
                             if current_pid and pid_str == current_pid:
                                 existing["status"] = "concluded"
+                                reaped.append(existing["session_id"])
                             elif pid_str and pid_str.isdigit():
                                 if not is_pid_alive(int(pid_str)):
                                     existing["status"] = "concluded"
+                                    reaped.append(existing["session_id"])
                             else:
                                 # No PID recorded — legacy row, mark concluded
                                 existing["status"] = "concluded"
+                                reaped.append(existing["session_id"])
                         # Ensure status field exists for old rows
                         existing.setdefault("status", "")
                         existing.setdefault("pid", "")
@@ -175,6 +189,8 @@ def upsert_row(row: dict, reap_stale: bool = False) -> None:
             writer = csv.DictWriter(f, fieldnames=HEADERS)
             writer.writeheader()
             writer.writerows(rows)
+
+    return reaped
 
 
 def conclude_session(session_id: str, expected_pid: str = "") -> None:
@@ -205,6 +221,38 @@ def conclude_session(session_id: str, expected_pid: str = "") -> None:
             writer = csv.DictWriter(f, fieldnames=HEADERS)
             writer.writeheader()
             writer.writerows(rows)
+
+
+def conclude_by_pid(pid: str) -> list[str]:
+    """Mark ALL alive sessions with the given PID as concluded.
+
+    Returns the list of session IDs that were concluded.
+    This handles the case where /clear creates multiple sessions under
+    the same PID — the watchdog can conclude them all at once.
+    """
+    if not COST_LOG.exists():
+        return []
+
+    concluded: list[str] = []
+    with CsvLock():
+        rows: list[dict] = []
+        with open(COST_LOG, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for existing in reader:
+                if (existing.get("status") == "alive"
+                        and existing.get("pid", "").strip() == pid):
+                    existing["status"] = "concluded"
+                    concluded.append(existing["session_id"])
+                existing.setdefault("status", "")
+                existing.setdefault("pid", "")
+                rows.append(existing)
+
+        with open(COST_LOG, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=HEADERS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    return concluded
 
 
 # --- Google Sheets sync ---
@@ -286,7 +334,25 @@ def get_row_by_session(session_id: str) -> dict | None:
 
 
 def main():
-    # Handle --conclude-session mode (called by the exit watchdog)
+    # Handle --conclude-pid mode (called by the exit watchdog)
+    # Concludes ALL alive sessions under the given PID and syncs each to Sheets.
+    if "--conclude-pid" in sys.argv:
+        idx = sys.argv.index("--conclude-pid")
+        if idx + 1 < len(sys.argv):
+            pid = sys.argv[idx + 1]
+            concluded = conclude_by_pid(pid)
+            for sid in concluded:
+                print(f"Session {sid} marked concluded (PID {pid})", file=sys.stderr)
+                if should_sync_sheets(force=True):
+                    row = get_row_by_session(sid)
+                    if row:
+                        sync_to_sheets(row)
+                        print(f"Sheets synced final cost for {sid}", file=sys.stderr)
+            if not concluded:
+                print(f"No alive sessions found for PID {pid}", file=sys.stderr)
+        sys.exit(0)
+
+    # Handle --conclude-session mode (legacy, kept for compatibility)
     if "--conclude-session" in sys.argv:
         idx = sys.argv.index("--conclude-session")
         if idx + 1 < len(sys.argv):
@@ -324,7 +390,15 @@ def main():
     row = build_row(input_data, live_mode, pid)
 
     # Always upsert to local CSV; in live mode also reap stale sessions.
-    upsert_row(row, reap_stale=live_mode)
+    reaped = upsert_row(row, reap_stale=live_mode)
+
+    # Sync reaped sessions to Google Sheets (force=True, they need final sync)
+    for reaped_sid in reaped:
+        if should_sync_sheets(force=True):
+            reaped_row = get_row_by_session(reaped_sid)
+            if reaped_row:
+                sync_to_sheets(reaped_row)
+                print(f"Sheets synced reaped session {reaped_sid}", file=sys.stderr)
 
     # Sync to Google Sheets (throttled for live, always for stop)
     if should_sync_sheets(force=not live_mode):
@@ -600,8 +674,8 @@ if [ -n "$_sid" ]; then
     (
       # Poll until Claude Code process dies
       while kill -0 "$_stable_pid" 2>/dev/null; do sleep 2; done
-      # Process is dead — mark session as concluded (pass PID to guard against resume race)
-      uv run ~/.claude/hooks/log_session_cost.py --conclude-session "$_sid" --pid "$_stable_pid" >>/tmp/claude-sheets-sync.log 2>&1
+      # Process is dead — conclude ALL sessions under this PID
+      uv run ~/.claude/hooks/log_session_cost.py --conclude-pid "$_stable_pid" >>/tmp/claude-sheets-sync.log 2>&1
       rm -f "$_wdpf"
     ) &
     echo $! > "$_wdpf"
