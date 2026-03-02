@@ -146,22 +146,26 @@ def build_row(input_data: dict, live_mode: bool, pid: str = "") -> dict:
     }
 
 
-def upsert_row(row: dict, reap_stale: bool = False) -> list[str]:
+def upsert_row(row: dict, reap_stale: bool = False) -> tuple[list[str], list[str]]:
     """Update existing row for session_id in-place, or append if not found.
 
-    When reap_stale is True (live mode), check all other "alive" sessions
-    and mark them "concluded" if:
-    - Their PID is no longer running (or missing), OR
-    - They share the same PID as the current session but have a different
-      session_id (happens on /clear where the process stays but session changes).
+    When reap_stale is True (live mode), check all other "alive" sessions:
+    - Same PID, different session_id (/clear): **replace** the old row with the
+      new session data so only one row exists per Claude process.  The cost
+      counter is cumulative per-process, so keeping both rows double-counts.
+    - Dead PID or missing PID: mark as "concluded" (reaped).
 
-    Returns a list of session IDs that were reaped (status changed to concluded).
+    Returns (reaped_session_ids, replaced_old_session_ids).
+    Reaped sessions need their own Sheets sync (concluded).
+    Replaced sessions need the current row synced to Sheets using the old
+    session_id as a fallback lookup key.
     """
     with CsvLock():
         session_id = row["session_id"]
         current_pid = row.get("pid", "").strip()
         rows: list[dict] = []
         reaped: list[str] = []
+        replaced: list[str] = []  # old session_ids replaced by current session
         found = False
 
         if COST_LOG.exists():
@@ -183,10 +187,16 @@ def upsert_row(row: dict, reap_stale: bool = False) -> list[str]:
                         if reap_stale and existing.get("status") == "alive":
                             pid_str = existing.get("pid", "").strip()
                             # Same PID, different session_id → /clear or resume
-                            # The old session is superseded by the new one.
+                            # Replace the old row with new session data instead
+                            # of keeping both (cost is cumulative per-process).
                             if current_pid and pid_str == current_pid:
-                                existing["status"] = "concluded"
-                                reaped.append(existing["session_id"])
+                                replaced.append(existing["session_id"])
+                                if not found:
+                                    # Put the new row in the old row's position
+                                    rows.append(row)
+                                    found = True
+                                # else: already inserted new row, just drop old
+                                continue
                             elif pid_str and pid_str.isdigit():
                                 if not is_pid_alive(int(pid_str)):
                                     existing["status"] = "concluded"
@@ -208,7 +218,7 @@ def upsert_row(row: dict, reap_stale: bool = False) -> list[str]:
             writer.writeheader()
             writer.writerows(rows)
 
-    return reaped
+    return reaped, replaced
 
 
 def conclude_session(session_id: str, expected_pid: str = "") -> None:
@@ -296,11 +306,15 @@ def touch_throttle():
     THROTTLE_FILE.touch()
 
 
-def sync_to_sheets(row: dict) -> bool:
+def sync_to_sheets(row: dict, old_session_id: str = "") -> bool:
     """Upsert a row in Google Sheets by session_id.
 
     Protected by SheetsLock to prevent concurrent find+append races
     where two processes both see no existing row and both append.
+
+    If old_session_id is provided (from a /clear replacement), the old
+    Sheets row is found by that ID and updated in-place with the new
+    session data, preventing duplicate rows.
     """
     try:
         import gspread
@@ -329,6 +343,13 @@ def sync_to_sheets(row: dict) -> bool:
                 cell = ws.find(session_id, in_column=2)
             except gspread.exceptions.CellNotFound:
                 cell = None
+
+            # Fallback: find by old session_id (after /clear replaced it)
+            if not cell and old_session_id:
+                try:
+                    cell = ws.find(old_session_id, in_column=2)
+                except gspread.exceptions.CellNotFound:
+                    cell = None
 
             if cell:
                 # Update existing row
@@ -413,7 +434,7 @@ def main():
     row = build_row(input_data, live_mode, pid)
 
     # Always upsert to local CSV; in live mode also reap stale sessions.
-    reaped = upsert_row(row, reap_stale=live_mode)
+    reaped, replaced = upsert_row(row, reap_stale=live_mode)
 
     # Sync reaped sessions to Google Sheets (force=True, they need final sync)
     for reaped_sid in reaped:
@@ -423,10 +444,18 @@ def main():
                 sync_to_sheets(reaped_row)
                 print(f"Sheets synced reaped session {reaped_sid}", file=sys.stderr)
 
-    # Sync to Google Sheets (throttled for live, always for stop)
-    if should_sync_sheets(force=not live_mode):
-        if sync_to_sheets(row):
+    # Sync to Google Sheets (throttled for live, always for stop).
+    # Force sync when a /clear replacement happened so the old Sheets row
+    # gets updated before the next tick tries to find by the new session_id.
+    # Pass the old session_id so sync_to_sheets can find and update the
+    # existing Sheets row instead of appending a duplicate.
+    force_sync = bool(replaced) or not live_mode
+    old_sid = replaced[0] if replaced else ""
+    if should_sync_sheets(force=force_sync):
+        if sync_to_sheets(row, old_session_id=old_sid):
             print(f"Sheets synced", file=sys.stderr)
+            if replaced:
+                print(f"Replaced old session(s) {replaced} in Sheets", file=sys.stderr)
 
     print(f"Session cost logged ({('live' if live_mode else 'final')}): ${row['total_cost_usd']}", file=sys.stderr)
     sys.exit(0)
