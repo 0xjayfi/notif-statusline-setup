@@ -481,15 +481,16 @@ input=$(cat)
 find_claude_pid() {
   local pid=$PPID
   while [ "$pid" -gt 1 ]; do
-    # Use /proc/comm (executable name only) to avoid false matches on
-    # paths like ".claude/statusline.sh" in intermediate shell cmdlines.
+    # Get the executable base name (works on both macOS and Linux)
     local comm
-    comm=$(cat /proc/$pid/comm 2>/dev/null)
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | xargs basename 2>/dev/null)
     if [ "$comm" = "claude" ]; then
       echo "$pid"
       return
     fi
-    pid=$(awk '{print $4}' /proc/$pid/stat 2>/dev/null || echo 1)
+    # Walk up to the parent process
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -z "$pid" ] && break
   done
   echo "$PPID"  # fallback
 }
@@ -516,7 +517,7 @@ current_dir_path=$(echo "$input" | grep -o '"current_dir":"[^"]*"' | sed 's/"cur
 project_name=$(basename "$current_dir_path")
 
 # Get context window data
-used_pct=$(echo "$input" | grep -o '"used_percentage":[0-9.]*' | sed 's/"used_percentage"://')
+used_pct=$(echo "$input" | grep -o '"used_percentage":[0-9.]*' | head -1 | sed 's/"used_percentage"://')
 
 # Extract the current_usage object and parse its fields
 # This approach extracts everything between "current_usage":{...}
