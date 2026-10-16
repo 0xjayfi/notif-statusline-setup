@@ -12,6 +12,7 @@ Get notified via [ntfy.sh](https://ntfy.sh) when:
 ### Custom Statusline (`install-statusline.sh`)
 Display a rich statusline showing:
 - Model name
+- Effort level (when the model supports it)
 - Context window usage (with color gradient)
 - Session cost estimate
 - Git branch (when in a repo)
@@ -19,7 +20,7 @@ Display a rich statusline showing:
 
 **Example Output:**
 ```
-🤖 Claude Sonnet 4 │ ⏳ [====------] 42% 84k/200k tokens │ 💰 $1.23 │ 🌿 main │ 📁 my-project
+🤖 Claude Sonnet 4 │ 🧠 high │ ⏳ [====------] 42% 84k/200k tokens │ 💰 $1.23 │ 🌿 main │ 📁 my-project
 ```
 
 ### Session Cost Tracking

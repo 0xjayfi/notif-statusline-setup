@@ -516,6 +516,10 @@ model_name=$(echo "$input" | grep -o '"display_name":"[^"]*"' | head -1 | sed 's
 current_dir_path=$(echo "$input" | grep -o '"current_dir":"[^"]*"' | sed 's/"current_dir":"//;s/"$//')
 project_name=$(basename "$current_dir_path")
 
+# Get effort level from the "effort":{...} object (absent for models without effort)
+effort_block=$(echo "$input" | grep -o '"effort":{[^}]*}' | head -1)
+effort_level=$(echo "$effort_block" | grep -o '"level":"[^"]*"' | sed 's/"level":"//;s/"$//')
+
 # Get context window data
 used_pct=$(echo "$input" | grep -o '"used_percentage":[0-9.]*' | head -1 | sed 's/"used_percentage"://')
 
@@ -538,6 +542,7 @@ total_output_tokens=$(echo "$input" | grep -o '"total_output_tokens":[0-9]*' | s
 {
   echo "=== PARSED VARIABLES ==="
   echo "model_name: $model_name"
+  echo "effort_level: $effort_level"
   echo "current_dir_path: $current_dir_path"
   echo "project_name: $project_name"
   echo "used_pct: $used_pct"
@@ -569,7 +574,7 @@ format_tokens() {
 CYAN=$'\033[0;36m'         # For model name
 MAGENTA=$'\033[0;35m'      # For project name
 GREEN=$'\033[0;32m'        # For git branch
-YELLOW=$'\033[0;33m'       # For input/output tokens
+YELLOW=$'\033[0;33m'       # For effort level
 GRAY=$'\033[0;90m'         # For separator
 RESET=$'\033[0m'
 
@@ -589,6 +594,11 @@ separator="${GRAY} │ ${RESET}"
 
 # 1. Model name with robot emoji
 output="${CYAN}🤖 ${model_name}${RESET}"
+
+# 1.5. Effort level with brain emoji
+if [ -n "$effort_level" ]; then
+  output="${output}${separator}${YELLOW}🧠 ${effort_level}${RESET}"
+fi
 
 # 2. Progress bar with hourglass emoji & 3. Percentage (combined)
 # Calculate actual token usage from current_usage fields for accurate display
@@ -800,6 +810,7 @@ echo "Installation complete!"
 echo ""
 echo "The statusline displays:"
 echo "  🤖 Model name (cyan)"
+echo "  🧠 Effort level (yellow, if the model supports it)"
 echo "  ⏳ Context usage progress bar with gradient colors"
 echo "  💰 Session cost estimate (cyan)"
 echo "  🌿 Git branch (green, if in a repo)"
